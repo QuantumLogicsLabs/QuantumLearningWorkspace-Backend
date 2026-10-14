@@ -120,5 +120,24 @@ async def send_otp_email(to_email: str, otp_code: str) -> bool:
     # Real SMTP is active: Never leak the plaintext OTP code into server logs!
     logger.info(f"[EMAIL OTP] Dispatching verification email to {to_email} via SMTP ({host}:{port})")
 
-    return await asyncio.to_thread(_send_smtp_sync, to_email, otp_code, host, port, user, password)
+    success = await asyncio.to_thread(_send_smtp_sync, to_email, otp_code, host, port, user, password)
+    if success:
+        return True
+
+    # If SMTP delivery completely failed:
+    # In production, strictly NEVER leak the OTP into logs.
+    is_production = os.getenv("ENVIRONMENT", "").lower() in ("production", "prod") or bool(os.getenv("VERCEL")) or bool(os.getenv("RENDER"))
+    if not is_production:
+        # Local development fail-safe:
+        # Display OTP in console so developers are not blocked during local runs.
+        print("\n" + "!" * 55, flush=True)
+        print("[StudyMind AI OTP - LOCAL RUN FAIL-SAFE FALLBACK]", flush=True)
+        print("   SMTP delivery failed on local network/ports.")
+        print(f"   Recipient: {to_email}")
+        print(f"   Code:      >>> {otp_code} <<< (Valid for 10 minutes)")
+        print("!" * 55 + "\n", flush=True)
+        logger.warning(f"[EMAIL OTP DEV FALLBACK] SMTP failed. OTP code for local testing: {otp_code}")
+        return True
+
+    return False
 
