@@ -90,8 +90,7 @@ async def send_otp_email(to_email: str, otp_code: str) -> bool:
         return True
 
     # Real SMTP is active: Never leak the plaintext OTP code into server logs!
-    logger.info(f"[EMAIL OTP] Verification email dispatched to {to_email}")
-    print(f"[EMAIL OTP] Verification email successfully sent to {to_email}", flush=True)
+    logger.info(f"[EMAIL OTP] Dispatching verification email to {to_email} via SMTP ({host}:{port})")
 
     return await asyncio.to_thread(_send_smtp_sync, to_email, otp_code, host, port, user, password)
 
