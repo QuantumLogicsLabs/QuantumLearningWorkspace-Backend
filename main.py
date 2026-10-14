@@ -292,7 +292,12 @@ async def signup(request: SignupRequest):
         await users.insert_one(new_user)
 
     # Send OTP email (and log to console for dev mode)
-    await send_otp_email(email_clean, otp_code)
+    email_delivered = await send_otp_email(email_clean, otp_code)
+    if not email_delivered:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not send verification email. Please verify your email address and try again in a few moments."
+        )
 
     return {
         "message": "Verification code sent to your email.",
@@ -385,7 +390,12 @@ async def resend_otp(request: ResendOtpRequest):
         }
     )
 
-    await send_otp_email(email_clean, new_otp)
+    email_delivered = await send_otp_email(email_clean, new_otp)
+    if not email_delivered:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not send verification email. Please try again in a few moments."
+        )
     return {"message": "A new verification code has been sent to your email."}
 
 

@@ -58,16 +58,44 @@ def _send_smtp_sync(to_email: str, otp_code: str, host: str, port: int, user: st
 
         msg.attach(MIMEText(text, "plain"))
         msg.attach(MIMEText(html, "html"))
+        msg_str = msg.as_string()
 
-        with smtplib.SMTP(host, port, timeout=10) as server:
-            server.starttls()
-            server.login(user, password)
-            server.sendmail(user, [to_email], msg.as_string())
+        def _deliver(target_port: int) -> bool:
+            if target_port == 465:
+                with smtplib.SMTP_SSL(host, target_port, timeout=12) as server:
+                    server.login(user, password)
+                    server.sendmail(user, [to_email], msg_str)
+                    return True
+            else:
+                with smtplib.SMTP(host, target_port, timeout=12) as server:
+                    server.starttls()
+                    server.login(user, password)
+                    server.sendmail(user, [to_email], msg_str)
+                    return True
 
-        logger.info(f"Successfully delivered OTP email to {to_email}")
-        return True
+        # Try configured primary port first
+        try:
+            if _deliver(port):
+                logger.info(f"Successfully delivered OTP email to {to_email} via port {port}")
+                print(f"[EMAIL OTP] Verification email successfully sent to {to_email} (port {port})", flush=True)
+                return True
+        except Exception as primary_err:
+            logger.warning(f"Primary SMTP delivery on {host}:{port} failed: {primary_err}")
+
+        # Fallback port retry (587 <-> 465)
+        fallback_port = 465 if port != 465 else 587
+        logger.info(f"[EMAIL OTP] Retrying delivery via fallback port {host}:{fallback_port}...")
+        try:
+            if _deliver(fallback_port):
+                logger.info(f"Successfully delivered OTP email to {to_email} via fallback port {fallback_port}")
+                print(f"[EMAIL OTP] Verification email successfully sent to {to_email} (fallback port {fallback_port})", flush=True)
+                return True
+        except Exception as fallback_err:
+            logger.warning(f"Fallback SMTP delivery on {host}:{fallback_port} also failed: {fallback_err}")
+            return False
+
     except Exception as e:
-        logger.warning(f"Failed to send email via SMTP ({host}:{port}): {e}")
+        logger.error(f"Failed to prepare or send email via SMTP ({host}:{port}): {e}")
         return False
 
 
@@ -90,8 +118,26 @@ async def send_otp_email(to_email: str, otp_code: str) -> bool:
         return True
 
     # Real SMTP is active: Never leak the plaintext OTP code into server logs!
-    logger.info(f"[EMAIL OTP] Verification email dispatched to {to_email}")
-    print(f"[EMAIL OTP] Verification email successfully sent to {to_email}", flush=True)
+    logger.info(f"[EMAIL OTP] Dispatching verification email to {to_email} via SMTP ({host}:{port})")
 
-    return await asyncio.to_thread(_send_smtp_sync, to_email, otp_code, host, port, user, password)
+    success = await asyncio.to_thread(_send_smtp_sync, to_email, otp_code, host, port, user, password)
+    if success:
+        return True
+
+    # If SMTP delivery completely failed:
+    # In production, strictly NEVER leak the OTP into logs.
+    is_production = os.getenv("ENVIRONMENT", "").lower() in ("production", "prod") or bool(os.getenv("VERCEL")) or bool(os.getenv("RENDER"))
+    if not is_production:
+        # Local development fail-safe:
+        # Display OTP in console so developers are not blocked during local runs.
+        print("\n" + "!" * 55, flush=True)
+        print("[StudyMind AI OTP - LOCAL RUN FAIL-SAFE FALLBACK]", flush=True)
+        print("   SMTP delivery failed on local network/ports.")
+        print(f"   Recipient: {to_email}")
+        print(f"   Code:      >>> {otp_code} <<< (Valid for 10 minutes)")
+        print("!" * 55 + "\n", flush=True)
+        logger.warning(f"[EMAIL OTP DEV FALLBACK] SMTP failed. OTP code for local testing: {otp_code}")
+        return True
+
+    return False
 
