@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from main import app, UPLOAD_DIRECTORY, process_file_ingestion
-from models import Upload
-from database import get_uploads_collection
-from auth_utils import create_access_token
+from web.backend.models import Upload
+from web.backend.database import get_uploads_collection
+from web.backend.auth_utils import create_access_token
 
 
 @pytest.fixture(autouse=True)
@@ -112,7 +112,7 @@ async def test_process_file_ingestion_success(monkeypatch):
             return MockResponse()
 
     import httpx
-    monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
+    import main; monkeypatch.setattr(main.httpx, "AsyncClient", MockAsyncClient); monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
 
     await process_file_ingestion(
         file_id=inserted_id,
@@ -168,7 +168,7 @@ async def test_process_file_ingestion_failure(monkeypatch):
             return MockFailResponse()
 
     import httpx
-    monkeypatch.setattr(httpx, "AsyncClient", MockFailAsyncClient)
+    import main; monkeypatch.setattr(main.httpx, "AsyncClient", MockFailAsyncClient); monkeypatch.setattr(httpx, "AsyncClient", MockFailAsyncClient)
 
     await process_file_ingestion(
         file_id=inserted_id,
@@ -223,6 +223,48 @@ def test_preview_and_delete_with_document_id():
     assert not os.path.exists(physical_path)
 
 
+
+
+def test_upload_supported_file_formats():
+    """Verify upload accepts Word, Text, Markdown, Excel, and PowerPoint files."""
+    client = TestClient(app)
+    token = create_access_token("user_multiformat_test@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    sample_files = [
+        ("notes.docx", b"PK fake docx content", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"),
+        ("summary.txt", b"Plain text study notes and formulas.", "text/plain", ".txt"),
+        ("readme.md", b"# Markdown Notes\n## Topic 1", "text/markdown", ".md"),
+        ("grades.csv", b"id,score\n1,95\n2,88", "text/csv", ".csv"),
+        ("data.xlsx", b"PK fake xlsx content", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"),
+        ("presentation.pptx", b"PK fake pptx content", "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"),
+        ("slides.ppt", b"\xd0\xcf\x11\xe0 fake ppt content", "application/vnd.ms-powerpoint", ".ppt"),
+    ]
+
+    for filename, file_bytes, mime, expected_ext in sample_files:
+        payload = (filename, io.BytesIO(file_bytes), mime)
+        res = client.post("/upload", files={"file": payload}, headers=headers)
+        assert res.status_code == 200, f"Failed for {filename}: {res.text}"
+        data = res.json()
+        assert "document_id" in data
+        doc_id = data["document_id"]
+        physical_path = os.path.join(UPLOAD_DIRECTORY, f"{doc_id}{expected_ext}")
+        assert os.path.exists(physical_path), f"File {physical_path} was not created"
+        with open(physical_path, "rb") as f:
+            assert f.read() == file_bytes
+
+
+def test_upload_unsupported_format_rejected():
+    """Verify upload rejects unsupported formats like .exe, .zip with 400 Bad Request."""
+    client = TestClient(app)
+    token = create_access_token("user_unsupported_test@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    payload = ("malicious.exe", io.BytesIO(b"MZ\x90\x00 binary content"), "application/x-msdownload")
+    res = client.post("/upload", files={"file": payload}, headers=headers)
+    assert res.status_code == 400
+    assert "Unsupported file format" in res.json()["detail"]
+
 if __name__ == "__main__":
     import asyncio
     print("--- Running Test 1: test_upload_model_fields ---")
@@ -232,6 +274,14 @@ if __name__ == "__main__":
     print("\n--- Running Test 2: test_upload_saves_as_document_id_pdf ---")
     test_upload_saves_as_document_id_pdf()
     print("✓ Passed: test_upload_saves_as_document_id_pdf")
+    print("\n--- Running Test: test_upload_supported_file_formats ---")
+    test_upload_supported_file_formats()
+    print("✓ Passed: test_upload_supported_file_formats")
+
+    print("\n--- Running Test: test_upload_unsupported_format_rejected ---")
+    test_upload_unsupported_format_rejected()
+    print("✓ Passed: test_upload_unsupported_format_rejected")
+
 
     print("\n--- Running Test 3: test_preview_and_delete_with_document_id ---")
     test_preview_and_delete_with_document_id()

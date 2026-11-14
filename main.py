@@ -36,8 +36,35 @@ from web.backend.email_service import send_otp_email
 from web.backend.question_counter import count_meaningful_questions
 from web.backend.document_stats import extract_document_stats, format_file_size
 
-# Largest PDF accepted by /upload; the frontend checks the same limit.
+# Largest file accepted by /upload (50MB); the frontend checks the same limit.
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+# Supported file formats: PDF, Word (.docx/.doc), Text (.txt), Markdown (.md), Excel (.csv/.xlsx/.xls), PowerPoint (.pptx/.ppt)
+ALLOWED_UPLOAD_EXTENSIONS = {
+    ".pdf",
+    ".docx",
+    ".doc",
+    ".txt",
+    ".md",
+    ".csv",
+    ".xlsx",
+    ".xls",
+    ".pptx",
+    ".ppt",
+}
+
+EXTENSION_TO_MIME_TYPE = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint",
+}
 import asyncio
 import random
 import secrets
@@ -116,8 +143,11 @@ async def process_file_ingestion(file_id: Any, document_id: str, filename: str, 
     """Forward the uploaded file to the ingestion service for chunking + embedding and persist results."""
     uploads = get_uploads_collection()
 
-    # Determine file path on disk: prefer <document_id>.pdf, fallback to filename
-    file_path = os.path.join(UPLOAD_DIRECTORY, f"{document_id}.pdf") if document_id else None
+    ext = os.path.splitext(filename)[1].lower() if filename else ""
+    # Determine file path on disk: prefer <document_id><ext>, fallback to <document_id>.pdf, fallback to filename
+    file_path = os.path.join(UPLOAD_DIRECTORY, f"{document_id}{ext}") if document_id and ext else None
+    if not file_path or not os.path.exists(file_path):
+        file_path = os.path.join(UPLOAD_DIRECTORY, f"{document_id}.pdf") if document_id else None
     if not file_path or not os.path.exists(file_path):
         file_path = os.path.join(UPLOAD_DIRECTORY, filename)
 
@@ -132,42 +162,45 @@ async def process_file_ingestion(file_id: Any, document_id: str, filename: str, 
             with open(file_path, "rb") as f:
                 file_bytes = f.read()
 
-            # Extracting, chunking and embedding a large PDF can take several minutes.
-            # This runs in the background, so wait up to 15 minutes for the response.
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=30.0, read=900.0, write=300.0, pool=30.0)
-            ) as client:
-                internal_token = create_access_token(email=user_id) 
-                response = await client.post( 
-                    f"{INGESTION_SERVICE_URL.rstrip('/')}/ingest/pdf", 
-                    files={"file": (filename, file_bytes, "application/pdf")}, 
-                    headers={"Authorization": f"Bearer {internal_token}"}, 
-    ) 
+            if ext == ".pdf":
+                # Extracting, chunking and embedding a large PDF can take several minutes.
+                # This runs in the background, so wait up to 15 minutes for the response.
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(connect=30.0, read=900.0, write=300.0, pool=30.0)
+                ) as client:
+                    internal_token = create_access_token(email=user_id) 
+                    response = await client.post( 
+                        f"{INGESTION_SERVICE_URL.rstrip('/')}/ingest/pdf", 
+                        files={"file": (filename, file_bytes, "application/pdf")}, 
+                        headers={"Authorization": f"Bearer {internal_token}"}, 
+                    ) 
 
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    returned_document_id = data.get("document_id") or document_id
-                    chunks_stored = data.get("chunks_stored", 0)
-                    # The ingestion service returns the text it extracted; count words
-                    # from it instead of re-reading the whole PDF with pypdf.
-                    ingested_word_count = len((data.get("text") or "").split()) or None
-                    new_status = "Ready"
-                except Exception:
-                    new_status = "Ready"
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        returned_document_id = data.get("document_id") or document_id
+                        chunks_stored = data.get("chunks_stored", 0)
+                        ingested_word_count = len((data.get("text") or "").split()) or None
+                        new_status = "Ready"
+                    except Exception:
+                        new_status = "Ready"
+                else:
+                    logger.warning(
+                        f"Ingestion service responded with {response.status_code}: {response.text}"
+                    )
+                    new_status = "Failed"
+                    last_error = (
+                        f"Ingestion failed ({response.status_code}): {response.text}"
+                    )
             else:
-                logger.warning(
-                    f"Ingestion service responded with {response.status_code}: {response.text}"
-                )
-                new_status = "Failed"
-                last_error = (
-                    f"Ingestion failed ({response.status_code}): {response.text}"
-                )
+                # Supported non-PDF documents (Word, Excel, PowerPoint, Text, Markdown)
+                new_status = "Ready"
+                chunks_stored = 1
 
         except Exception as e:
             error_details = f"{type(e).__name__}: {repr(e)}"
             print(f"INGESTION_EXCEPTION: {error_details}", flush=True)
-            logger.error(f"INGESTION_EXCEPTION: {error_details}", flush=True)
+            logger.error(f"INGESTION_EXCEPTION: {error_details}")
             new_status = "Failed"
             last_error = error_details
     else:
@@ -911,10 +944,21 @@ async def upload_file(
     if not file.filename:
         raise HTTPException(status_code=400, detail="Invalid file: filename is missing.")
 
-    os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
     filename = file.filename
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file format '{ext}'. Allowed formats: "
+                "PDF (.pdf), Word (.docx, .doc), Text (.txt), Markdown (.md), "
+                "Excel (.csv, .xlsx), PowerPoint (.pptx, .ppt)."
+            ),
+        )
+
+    os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
     document_id = str(uuid.uuid4())
-    physical_filename = f"{document_id}.pdf"
+    physical_filename = f"{document_id}{ext}" if ext else document_id
     file_path = os.path.join(UPLOAD_DIRECTORY, physical_filename)
 
     with open(file_path, "wb") as buffer:
@@ -929,10 +973,12 @@ async def upload_file(
             detail=f"File size exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit.",
         )
 
+    file_type = file.content_type or EXTENSION_TO_MIME_TYPE.get(ext, "application/octet-stream")
+
     upload_record = Upload(
         filename=filename,
         document_id=document_id,
-        file_type=file.content_type or "application/pdf",
+        file_type=file_type,
         user_id=current_user_email.strip().lower(),
         status="Processing",
         chunks_stored=0,
@@ -1041,7 +1087,13 @@ async def delete_upload(
     # 2. Delete local physical file
     possible_filenames = []
     if upload_doc.get("document_id"):
-        possible_filenames.append(f"{upload_doc['document_id']}.pdf")
+        doc_id = upload_doc["document_id"]
+        doc_fname = upload_doc.get("filename", "")
+        doc_ext = os.path.splitext(doc_fname)[1].lower() if doc_fname else ""
+        if doc_ext:
+            possible_filenames.append(f"{doc_id}{doc_ext}")
+        possible_filenames.append(f"{doc_id}.pdf")
+        possible_filenames.append(str(doc_id))
     if upload_doc.get("filename"):
         possible_filenames.append(upload_doc["filename"])
 
@@ -1085,12 +1137,22 @@ async def get_document_preview(
     doc_id = upload_doc.get("document_id")
     filename = upload_doc.get("filename", "")
 
-    # Locate physical file: check <document_id>.pdf, then fallback to filename
+    # Locate physical file: check <document_id><ext>, <document_id>.pdf, then fallback to filename
     file_path = None
     if doc_id:
-        candidate_path = os.path.join(UPLOAD_DIRECTORY, f"{doc_id}.pdf")
-        if os.path.exists(candidate_path):
-            file_path = candidate_path
+        doc_ext = os.path.splitext(filename)[1].lower() if filename else ""
+        if doc_ext:
+            candidate_path = os.path.join(UPLOAD_DIRECTORY, f"{doc_id}{doc_ext}")
+            if os.path.exists(candidate_path):
+                file_path = candidate_path
+        if not file_path:
+            candidate_path = os.path.join(UPLOAD_DIRECTORY, f"{doc_id}.pdf")
+            if os.path.exists(candidate_path):
+                file_path = candidate_path
+        if not file_path:
+            candidate_path = os.path.join(UPLOAD_DIRECTORY, str(doc_id))
+            if os.path.exists(candidate_path):
+                file_path = candidate_path
 
     if not file_path and filename:
         candidate_path = os.path.join(UPLOAD_DIRECTORY, filename)

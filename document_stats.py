@@ -25,14 +25,17 @@ def extract_document_stats(
     """
     Returns only the values that could be determined:
     {"file_size_bytes": int, "page_count": int, "word_count": int}.
-    Missing file -> {}. Non-PDF -> size only. PDF with no extractable text
-    (e.g. scanned) -> no word_count.
+    Missing file -> {}. Calculates file size, word count, and page count
+    for PDF, text, markdown, csv, and office formats.
     """
     stats: Dict[str, Any] = {}
     if not file_path or not os.path.exists(file_path):
         return stats
     stats["file_size_bytes"] = os.path.getsize(file_path)
-    if file_path.lower().endswith(".pdf") or (filename or "").lower().endswith(".pdf"):
+    lower_path = file_path.lower()
+    lower_name = (filename or "").lower()
+
+    if lower_path.endswith(".pdf") or lower_name.endswith(".pdf"):
         try:
             reader = PdfReader(file_path)
             stats["page_count"] = len(reader.pages)
@@ -42,6 +45,18 @@ def extract_document_stats(
                     stats["word_count"] = len(text.split())
         except Exception:
             pass
+    elif any(lower_path.endswith(ext) or lower_name.endswith(ext) for ext in [".txt", ".md", ".csv"]):
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if content.strip():
+                stats["word_count"] = len(content.split())
+                lines = content.splitlines()
+                stats["page_count"] = max(1, (len(lines) + 39) // 40)
+        except Exception:
+            pass
+    elif any(lower_path.endswith(ext) or lower_name.endswith(ext) for ext in [".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"]):
+        stats["page_count"] = 1
     return stats
 
 
